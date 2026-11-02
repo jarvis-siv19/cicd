@@ -13,7 +13,10 @@ class DeploymentProvider(ABC):
 
 async def request(method, url, token, **kwargs):
     async with httpx.AsyncClient(timeout=30) as client:
-        response = await client.request(method,url,headers={'Authorization':f'Bearer {token}','Accept':'application/json'},**kwargs)
+        try:
+            response = await client.request(method,url,headers={'Authorization':f'Bearer {token}','Accept':'application/json'},**kwargs)
+        except httpx.HTTPError as e:
+            raise ProviderError('Provider request failed; check connectivity and integration settings.') from e
         if response.is_error: raise ProviderError(f'Provider rejected request ({response.status_code})')
         return response.json() if response.content else {}
 
@@ -57,18 +60,19 @@ class GitHubActions(DeploymentProvider):
     async def status(self,project,external_id):
         token=await installation_token(project['provider_config'].get('installation_id'))
         return await request('GET',f'https://api.github.com/repos/{project["repositories"][0]}/actions/runs/{int(external_id)}',token)
-    async def builds(self,project):
-        token=await installation_token(project['provider_config'].get('installation_id'))
-        return await request('GET',f'https://api.github.com/repos/{project["repositories"][0]}/actions/runs?per_page=30',token)
+    async def builds(self,project,repo=None,installation=None):
+        repository=repo or project['repositories'][0]
+        token=await installation_token(installation or project['provider_config'].get('installation_id'))
+        return await request('GET',f'https://api.github.com/repos/{repository}/actions/runs?per_page=30',token)
 
 class Vercel(DeploymentProvider):
     capabilities={'deploy','redeploy','rollback'}
-    def token(self):
-        token=os.getenv('VERCEL_TOKEN')
+    def token(self,project):
+        token=project.get('provider_config',{}).get('integration_token') or os.getenv('VERCEL_TOKEN')
         if not token: raise ProviderError('Configure VERCEL_TOKEN on the server.')
         return token
     async def execute(self,action,project,deployment):
-        cfg=project.get('provider_config',{}); token=self.token()
+        cfg=project.get('provider_config',{}); token=self.token(project)
         if not cfg.get('project_id'): raise ProviderError('Set the Vercel project ID in project settings.')
         params={'teamId':cfg['team_id']} if cfg.get('team_id') else {}
         body={'name':project['name'].lower().replace(' ','-'),'project':cfg['project_id'],'target':'production' if deployment['environment']=='production' else 'preview'}
@@ -80,7 +84,45 @@ class Vercel(DeploymentProvider):
             body['gitSource']={'type':'github','repoId':cfg['repo_id'],'ref':deployment['branch']}
         data=await request('POST','https://api.vercel.com/v13/deployments',token,json=body,params=params)
         return {'external_id':data['id'],'status':'building','url':data.get('url')}
-    async def status(self,project,external_id): return await request('GET',f'https://api.vercel.com/v13/deployments/{external_id}',self.token())
+    async def status(self,project,external_id): return await request('GET',f'https://api.vercel.com/v13/deployments/{external_id}',self.token(project))
+
+class CloudflarePages(DeploymentProvider):
+    capabilities={'deploy','redeploy'}
+    def details(self,project):
+        cfg=project.get('provider_config',{})
+        token=cfg.get('integration_token')
+        account=cfg.get('account_id')
+        project_name=cfg.get('project_name')
+        if not token: raise ProviderError('Select a connected Cloudflare Pages account in project settings.')
+        if not account or not project_name: raise ProviderError('Configure the Cloudflare account and Pages project on the selected account.')
+        return token,account,project_name
+    async def execute(self,action,project,deployment):
+        token,account,project_name=self.details(project)
+        url=f'https://api.cloudflare.com/client/v4/accounts/{account}/pages/projects/{project_name}/deployments'
+        data=await request('POST',url,token,data={'branch':deployment['branch']})
+        result=data.get('result',{})
+        if not result.get('id'): raise ProviderError('Cloudflare did not return a deployment ID.')
+        return {'external_id':str(result['id']),'status':'building','url':result.get('url')}
+    async def status(self,project,external_id):
+        token,account,project_name=self.details(project)
+        data=await request('GET',f'https://api.cloudflare.com/client/v4/accounts/{account}/pages/projects/{project_name}/deployments/{external_id}',token)
+        result=data.get('result',data)
+        stage_status=(result.get('latest_stage') or {}).get('status') or result.get('status','')
+        ready_state={'success':'READY','failure':'ERROR','canceled':'CANCELED','cancelled':'CANCELED'}.get(stage_status.lower())
+        return result|({'readyState':ready_state} if ready_state else {})
+
+class WorkflowDeployment(GitHubActions):
+    capabilities={'deploy','redeploy'}
+    async def execute(self,action,project,deployment):
+        cfg=project.get('provider_config',{})
+        if not cfg.get('workflow'): raise ProviderError('Set a provider-specific deployment workflow in project settings.')
+        token=await installation_token(cfg.get('installation_id'))
+        repo=project['repositories'][0]; root=f'https://api.github.com/repos/{repo}/actions'
+        await request('POST',f'{root}/workflows/{cfg["workflow"]}/dispatches',token,json={'ref':deployment['branch']})
+        return {'status':'queued','external_id':None,'message':'Deployment workflow dispatched; GitHub Actions will report progress.'}
+
+class GitHubPages(WorkflowDeployment): pass
+class ZohoCatalyst(WorkflowDeployment): pass
 
 class DockerCompose(DeploymentProvider):
     capabilities={'deploy','redeploy','rollback','restart','stop'}
@@ -89,4 +131,4 @@ class DockerCompose(DeploymentProvider):
         if not cfg.get('agent_id') or not cfg.get('service'): raise ProviderError('Configure an agent and allowlisted Compose service.')
         return {'status':'queued','agent_task':{'agent_id':cfg['agent_id'],'service':cfg['service'],'action':action,'image':deployment.get('image')}}
     async def status(self,project,external_id): return {'status':'queued'}
-PROVIDERS={'GitHub Actions':GitHubActions(),'Vercel':Vercel(),'Docker Compose':DockerCompose()}
+PROVIDERS={'GitHub Actions':GitHubActions(),'GitHub Pages':GitHubPages(),'Cloudflare Pages':CloudflarePages(),'Vercel':Vercel(),'Zoho Catalyst':ZohoCatalyst(),'Docker Compose':DockerCompose()}

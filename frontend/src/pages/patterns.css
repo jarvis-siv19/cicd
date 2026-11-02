@@ -1,0 +1,17 @@
+.pattern-layout{display:grid;grid-template-columns:minmax(0,1.1fr) minmax(350px,.9fr);gap:20px;margin-top:18px}
+.pattern-list{display:flex;flex-direction:column}
+.pattern-item{padding:18px 20px;border-bottom:1px solid #25312c}
+.pattern-item-head{display:flex;align-items:center;gap:12px}
+.pattern-item-head>span{display:grid;place-items:center;width:34px;height:34px;border:1px solid #3c5044;border-radius:8px;color:#a8e8c1}
+.pattern-item-head>div{flex:1}
+.pattern-item-head h3{font-size:12px;font-weight:550}
+.pattern-item-head p{margin-top:5px;font-size:10px;color:#9daea4}
+.pattern-item pre{max-height:180px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;margin:16px 0 0;padding:13px;background:#0a100d;border:1px solid #26332c;border-radius:5px;color:#b9c9bf;font:10px/1.6 'IBM Plex Mono',monospace}
+.pattern-source{width:100%;font:11px/1.6 'IBM Plex Mono',monospace;tab-size:2}
+.pattern-results{padding:0 18px}
+.pattern-results .simple-row{flex-wrap:wrap}
+.pattern-results .simple-row>b{flex:1}
+.pattern-results .simple-row>span{font-size:10px;color:#a9b8ae}
+.pattern-results .external{font-size:10px}
+@media(max-width:900px){.pattern-layout{grid-template-columns:1fr}}
+@media(max-width:560px){.pattern-item{padding:15px 13px}.pattern-item-head{gap:8px}.pattern-item-head .button{font-size:9px;padding:5px 7px}}

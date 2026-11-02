@@ -3,7 +3,7 @@ import os,asyncio,time
 from datetime import datetime,timezone,timedelta
 import dramatiq
 from dramatiq.brokers.redis import RedisBroker
-from .main import records,get,put,audit,run_check,verify,DEMO,now
+from .main import records,get,put,audit,run_check,verify,provider_project,DEMO,now
 from .providers import PROVIDERS,ProviderError
 from .notifications import deliver
 broker=RedisBroker(url=os.getenv('REDIS_URL','redis://localhost:6379/0'));dramatiq.set_broker(broker)
@@ -14,7 +14,7 @@ def health_job(id):
 @dramatiq.actor(max_retries=3,time_limit=60000)
 def provider_job(id):
     async def run():
-        d=get(id,'deployment');p=get(d['project'],'project')
+        d=get(id,'deployment');p=provider_project(get(d['project'],'project'))
         if d['status'] in ('healthy','failed','cancelled','rolled_back'):return
         if d['status']=='verifying':
             await verify(id,SYSTEM);return

@@ -7,5 +7,5 @@ export async function api<T=any>(path:string,method='GET',body?:unknown):Promise
  return r.json();
 }
 export function useDashboard(){return useQuery<Dashboard>({queryKey:['dashboard'],queryFn:()=>api('/dashboard'),refetchInterval:15000});}
-export function useAction(){const client=useQueryClient();return useMutation({mutationFn:({path,method='POST',body}:{path:string;method?:string;body?:unknown})=>api(path,method,body),onSuccess:()=>client.invalidateQueries()});}
+export function useAction<TData=unknown>(){const client=useQueryClient();return useMutation<TData,Error,{path:string;method?:string;body?:unknown}>({mutationFn:({path,method='POST',body})=>api<TData>(path,method,body),onSuccess:()=>client.invalidateQueries()});}
 export function ago(value:string){const m=Math.max(0,Math.floor((Date.now()-new Date(value).getTime())/60000));return m<1?'just now':m<60?`${m}m ago`:m<1440?`${Math.floor(m/60)}h ago`:`${Math.floor(m/1440)}d ago`;}

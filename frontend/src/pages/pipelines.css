@@ -1,0 +1,25 @@
+.pipeline-toolbar{display:flex;align-items:flex-end;gap:14px;margin-bottom:20px;flex-wrap:wrap}
+.pipeline-toolbar label{margin:0;min-width:220px}
+.pipeline-layout{display:grid;grid-template-columns:minmax(260px,.75fr) minmax(0,1.8fr);gap:18px;margin-bottom:20px}
+.workflow-list{display:flex;flex-direction:column}
+.workflow-file{display:flex;align-items:center;gap:11px;width:100%;padding:14px 18px;text-align:left;background:none;border-bottom:1px solid #202d36;color:#9bb0bd}
+.workflow-file:hover,.workflow-file.selected{background:#15222b;color:#dce8ee}
+.workflow-file.selected{box-shadow:inset 3px 0 var(--mint)}
+.workflow-file>span{display:flex;flex-direction:column;gap:5px;flex:1;min-width:0}
+.workflow-file b{font-size:11px;font-weight:500;overflow-wrap:anywhere}
+.workflow-file small{font-size:9px;overflow-wrap:anywhere}
+.workflow-editor label{margin-bottom:17px}
+.workflow-source{width:100%;font-family:'IBM Plex Mono',monospace;font-size:11px;line-height:1.65;tab-size:2}
+.workflow-read{padding:20px}
+.workflow-read>div{margin-bottom:16px;color:#93acbb}
+.workflow-read pre{margin:0;max-height:620px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;background:#0a1015;border:1px solid #26333b;border-radius:6px;padding:17px;color:#c5d5df}
+.workflow-stages{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:2px 0 20px}
+.workflow-stages>span:first-child{width:100%;font-size:10px;color:#8da2af}
+.stage-chip{border:1px solid #31453d;background:#14231d;color:#9ce7bf;border-radius:20px;padding:5px 9px;font-size:10px}
+.pipeline-stage-row{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;padding:20px}
+.pipeline-stage-card{display:flex;flex-direction:column;gap:8px;min-height:110px;border:1px solid #26383b;border-radius:7px;padding:15px;background:#0d1718}
+.pipeline-stage-card>span{font-family:'IBM Plex Mono',monospace;color:#75a48d;font-size:10px}
+.pipeline-stage-card b{font-size:12px;font-weight:550}
+.pipeline-stage-card small{line-height:1.5}
+@media(max-width:900px){.pipeline-layout{grid-template-columns:1fr}.pipeline-stage-row{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:560px){.pipeline-toolbar label{width:100%}.pipeline-stage-row{grid-template-columns:1fr}.workflow-editor.padding{padding:18px}}

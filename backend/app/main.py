@@ -1,7 +1,8 @@
-import os, json, secrets, hashlib, hmac, fnmatch
+import os, json, secrets, hashlib, hmac, fnmatch, base64, asyncio, re, shlex
 from datetime import datetime, timezone
 from uuid import uuid4
 from contextlib import asynccontextmanager
+from urllib.parse import quote
 from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.responses import RedirectResponse
 from starlette.middleware.sessions import SessionMiddleware
@@ -21,7 +22,7 @@ if not SESSION_KEY: raise RuntimeError('SESSION_SECRET is required outside demo 
 async def lifespan(app):
     if DEMO: seed()
     yield
-app=FastAPI(title='CI/CD Control Plane',lifespan=lifespan)
+app=FastAPI(title='CICD Control Plane',lifespan=lifespan)
 app.add_middleware(SessionMiddleware,secret_key=SESSION_KEY,https_only=not DEMO,same_site='lax')
 def now(): return datetime.now(timezone.utc).isoformat()
 def records(kind):
@@ -73,6 +74,28 @@ class SecretInput(BaseModel):
     name:str=Field(pattern=r'^[A-Z][A-Z0-9_]{0,99}$')
     value:str=Field(min_length=1,max_length=65536)
     environment:str='production'
+class WorkflowUpdate(BaseModel):
+    repo:str=Field(min_length=3,max_length=200)
+    path:str=Field(pattern=r'^\.github/workflows/[^/]+\.ya?ml$')
+    content:str=Field(min_length=1,max_length=262144)
+    mode:str='pull_request'
+    branch:str|None=Field(default=None,max_length=255)
+class RunnerInput(BaseModel):
+    repo:str=Field(pattern=r'^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$')
+    name:str=Field(min_length=1,max_length=80,pattern=r'^[A-Za-z0-9_.-]+$')
+    labels:str=Field(default='cicd,linux',max_length=100,pattern=r'^[A-Za-z0-9_.-]+(,[A-Za-z0-9_.-]+)*$')
+class ProviderAccountInput(BaseModel):
+    provider:str
+    name:str=Field(min_length=1,max_length=80)
+    account_id:str=Field(default='',max_length=180)
+    project_name:str=Field(default='',max_length=100)
+    team_id:str=Field(default='',max_length=100)
+    access_token:str=Field(default='',max_length=65536)
+class OrganizationPatternInput(BaseModel):
+    organization:str=Field(min_length=1,max_length=100,pattern=r'^[A-Za-z0-9_.-]+$')
+    name:str=Field(min_length=1,max_length=100)
+    path:str=Field(default='.github/workflows/cicd.yml',pattern=r'^\.github/workflows/[^/]+\.ya?ml$')
+    content:str=Field(min_length=1,max_length=262144)
 
 @app.get('/api/session')
 async def session(req:Request):
@@ -104,6 +127,38 @@ async def logout(req:Request,u=Depends(writer)):
 @app.get('/api/dashboard')
 async def dashboard(u=Depends(user)):
     return {kind:records(kind) for kind in ['project','repository','deployment','finding','health_check','host','service','activity','incident'] } | {'demo':DEMO,'user':u}
+@app.get('/api/actions/runs')
+async def recent_action_runs(limit:int=30,u=Depends(user)):
+    limit=max(1,min(limit,100))
+    managed=sorted((r for r in records('repository') if r.get('state')=='managed'),key=lambda r:r.get('updated_at') or '',reverse=True)
+    if DEMO:
+        projects={p['id']:p for p in records('project')}
+        runs=[]
+        for d in records('deployment'):
+            p=projects.get(d['project'])
+            if not p: continue
+            for repo in p.get('repositories',[]):
+                runs.append({'id':d['id'],'name':f'{p["name"]} · CI','repository':{'full_name':repo},'head_branch':d.get('branch','main'),'head_sha':d.get('commit','')*8,'actor':{'login':d.get('actor','Sivaganesh')},'status':'completed','conclusion':'success' if d['status']=='healthy' else 'failure' if d['status']=='failed' else d['status'],'created_at':d.get('started_at'),'html_url':None,'sample':True})
+        return {'workflow_runs':sorted(runs,key=lambda r:r.get('created_at') or '',reverse=True)[:limit],'repositories_scanned':len(managed),'repositories_total':len(managed),'truncated':False,'errors':[]}
+    semaphore=asyncio.Semaphore(8);token_cache={};cache_lock=asyncio.Lock()
+    async def runs_for(repository):
+        async with semaphore:
+            installation=repository.get('installation_id')
+            if not installation: return [],f'{repository["name"]}: no GitHub App installation'
+            try:
+                async with cache_lock:
+                    token=token_cache.get(str(installation))
+                    if token is None:
+                        token=await installation_token(installation)
+                        token_cache[str(installation)]=token
+                result=await provider_request('GET',f'https://api.github.com/repos/{repository["name"]}/actions/runs?per_page=20',token)
+                return [{**run,'repository':{'full_name':repository['name']}} for run in result.get('workflow_runs',[])],None
+            except ProviderError as e: return [],f'{repository["name"]}: {e}'
+    results=await asyncio.gather(*(runs_for(r) for r in managed[:200]))
+    errors=[error for _,error in results if error]
+    workflow_runs=sorted((run for runs,_ in results for run in runs),key=lambda run:run.get('created_at') or '',reverse=True)[:limit]
+    if not workflow_runs and errors and not any(runs for runs,_ in results): raise HTTPException(503,'Unable to read workflow runs: '+'; '.join(errors[:5]))
+    return {'workflow_runs':workflow_runs,'repositories_scanned':min(len(managed),200),'repositories_total':len(managed),'truncated':len(managed)>200,'errors':errors}
 @app.post('/api/projects')
 async def create_project(body:ProjectInput,u=Depends(writer)):
     if body.provider not in PROVIDERS: raise HTTPException(400,'Unknown provider')
@@ -114,8 +169,16 @@ async def create_project(body:ProjectInput,u=Depends(writer)):
     audit(f'{body.name} project created','project',u['login']); return data
 @app.patch('/api/projects/{id}')
 async def update_project(id:str,body:dict,u=Depends(admin)):
-    p=get(id,'project'); allowed={'name','description','branch','url','public','public_name','public_description','auto_rollback','provider_config','security_policy'}
-    p.update({k:v for k,v in body.items() if k in allowed}); put('project',p); audit(f'{p["name"]} settings updated',actor=u['login']); return p
+    p=get(id,'project'); allowed={'name','description','branch','url','public','public_name','public_description','auto_rollback','provider_config','security_policy','provider'}
+    changes={k:v for k,v in body.items() if k in allowed}
+    if 'provider' in changes and changes['provider'] not in PROVIDERS: raise HTTPException(400,'Unknown provider')
+    if 'provider_config' in changes and not isinstance(changes['provider_config'],dict): raise HTTPException(400,'Provider configuration must be an object')
+    selected_provider=changes.get('provider',p['provider'])
+    selected_config=changes.get('provider_config',p.get('provider_config',{}))
+    if selected_config.get('integration_account_id'):
+        account=get(selected_config['integration_account_id'],'integration_account')
+        if account['provider']!=selected_provider: raise HTTPException(400,'Selected deployment account does not match the project provider')
+    p.update(changes); put('project',p); audit(f'{p["name"]} settings updated',actor=u['login']); return p
 @app.post('/api/repositories/discover')
 async def discover_repos(u=Depends(admin)):
     if DEMO:
@@ -148,6 +211,8 @@ async def inspect_repo(body:dict,u=Depends(user)):
 @app.post('/api/projects/{id}/deployments')
 async def deployment(id:str,body:DeployInput,u=Depends(writer)):
     p=get(id,'project'); provider=PROVIDERS[p['provider']]
+    try: p=provider_project(p)
+    except ProviderError as e: raise HTTPException(503,str(e))
     if body.action not in provider.capabilities: raise HTTPException(400,'This provider does not support this action')
     if body.environment not in p['environments']: raise HTTPException(400,'Unknown environment')
     findings=[f for f in records('finding') if f['project']==id]
@@ -166,10 +231,161 @@ async def deployment(id:str,body:DeployInput,u=Depends(writer)):
         put('agent_task',{'id':uuid4().hex,**d['agent_task'],'deployment':d['id'],'status':'queued'})
     audit(f'{p["name"]}: {body.action} queued','deployment',u['login']); return d
 @app.get('/api/projects/{id}/builds')
-async def builds(id:str,u=Depends(user)):
+async def builds(id:str,repo:str|None=None,u=Depends(user)):
     p=get(id,'project')
+    if repo is not None:
+        repository=workflow_repository(p,repo)
+    else:
+        repo=p.get('repositories',[None])[0]
+        repository=workflow_repository(p,repo) if repo else None
     if DEMO: return {'workflow_runs':[d for d in records('deployment') if d['project']==id]}
-    try: return await PROVIDERS['GitHub Actions'].builds(p)
+    try: return await PROVIDERS['GitHub Actions'].builds(p,repo,workflow_token(repository,p) if repository else None)
+    except ProviderError as e: raise HTTPException(503,str(e))
+@app.get('/api/runners')
+async def list_runners(repo:str,u=Depends(user)):
+    repository=workflow_repository({'repositories':[repo]},repo)
+    if DEMO: return {'runners':[],'repo':repo}
+    try:
+        token=await installation_token(repository.get('installation_id'))
+        data=await provider_request('GET',f'https://api.github.com/repos/{repo}/actions/runners?per_page=100',token)
+        return {'repo':repo,'runners':[{'id':r['id'],'name':r['name'],'status':r['status'],'busy':r['busy'],'labels':[l['name'] for l in r.get('labels',[])]} for r in data.get('runners',[])]}
+    except ProviderError as e: raise HTTPException(503,str(e))
+@app.post('/api/runners/install-command')
+async def runner_install_command(body:RunnerInput,u=Depends(admin)):
+    repository=next((r for r in records('repository') if r['id']==body.repo and r.get('state')=='managed'),None)
+    if not repository: raise HTTPException(400,'Choose a managed repository')
+    if DEMO: raise HTTPException(409,'Sample mode cannot issue real GitHub runner registration tokens.')
+    try:
+        token=await installation_token(repository.get('installation_id'))
+        data=await provider_request('POST',f'https://api.github.com/repos/{body.repo}/actions/runners/registration-token',token)
+    except ProviderError as e: raise HTTPException(503,str(e))
+    name='cicd-runner-'+re.sub(r'[^a-zA-Z0-9_.-]','-',body.name.lower())
+    volume='cicd-runner-'+hashlib.sha256(f'{body.repo}:{name}'.encode()).hexdigest()[:10]
+    command='docker run --detach --restart unless-stopped --name '+name
+    command+=' --volume '+volume+'-data:/runner/data --volume '+volume+'-work:/tmp/runner/work'
+    for key,value in [('RUNNER_NAME',body.name),('RUNNER_SCOPE','repo'),('REPO_URL',f'https://github.com/{body.repo}'),('RUNNER_TOKEN',data['token']),('RUNNER_WORKDIR','/tmp/runner/work'),('CONFIGURED_ACTIONS_RUNNER_FILES_DIR','/runner/data'),('LABELS',body.labels),('UNSET_CONFIG_VARS','true')]:
+        command+=' --env '+key+'='+shlex.quote(str(value))
+    command+=' ghcr.io/myoung34/github-runner:latest'
+    return {'repo':body.repo,'name':body.name,'expires_at':data.get('expires_at'),'command':command,'persistent':True,'image':'ghcr.io/myoung34/github-runner:latest','sample':False}
+@app.get('/api/organization-patterns')
+async def list_organization_patterns(u=Depends(admin)):
+    return {'patterns':records('organization_pattern'),'demo':DEMO}
+@app.post('/api/organization-patterns')
+async def create_organization_pattern(body:OrganizationPatternInput,u=Depends(admin)):
+    data={'id':uuid4().hex,'organization':body.organization,'name':body.name.strip(),'path':body.path,'content':body.content,'created_at':now(),'updated_at':now()}
+    if not data['name']: raise HTTPException(400,'Pattern name is required')
+    put('organization_pattern',data)
+    audit(f'{data["name"]} pattern created for {data["organization"]}','workflow',u['login'])
+    return data
+@app.post('/api/organization-patterns/{pattern_id}/apply')
+async def apply_organization_pattern(pattern_id:str,u=Depends(admin)):
+    pattern=get(pattern_id,'organization_pattern')
+    repos=[r for r in records('repository') if r.get('state')=='managed' and r.get('name','').split('/')[0].casefold()==pattern['organization'].casefold()]
+    if not repos: raise HTTPException(400,'No managed repositories found for this organization')
+    results=[]
+    for repository in repos[:100]:
+        if DEMO:
+            results.append({'repo':repository['name'],'status':'simulated'})
+            continue
+        try:
+            token=await installation_token(repository.get('installation_id'))
+            base_branch=workflow_branch(repository,{})
+            url=f'https://api.github.com/repos/{repository["name"]}'
+            base=await provider_request('GET',f'{url}/git/ref/heads/{quote(base_branch,safe="")}',token)
+            branch=f'cicd/{quote(pattern["name"].lower().replace(" ","-"),safe="-")}-{uuid4().hex[:8]}'
+            await provider_request('POST',f'{url}/git/refs',token,json={'ref':f'refs/heads/{branch}','sha':base['object']['sha']})
+            workflow_path=quote(pattern['path'],safe='/')
+            content_args={'repo':repository['name'],'path':workflow_path,'branch':quote(branch,safe='')}
+            try: current=await provider_request('GET',f'{url}/contents/{workflow_path}?ref={content_args["branch"]}',token)
+            except ProviderError as e:
+                if '404' not in str(e): raise
+                current={}
+            payload={'message':f'Apply organization pipeline pattern: {pattern["name"]}','content':base64.b64encode(pattern['content'].encode()).decode(),'branch':branch}
+            if current.get('sha'): payload['sha']=current['sha']
+            await provider_request('PUT',f'{url}/contents/{workflow_path}',token,json=payload)
+            pr=await provider_request('POST',f'{url}/pulls',token,json={'title':f'Apply pipeline pattern: {pattern["name"]}','body':f'Applies the shared **{pattern["name"]}** workflow pattern for **{pattern["organization"]}**. Review repository-specific build, secret, and deploy settings before merging.','head':branch,'base':base_branch})
+            results.append({'repo':repository['name'],'status':'pull_request_created','html_url':pr['html_url'],'number':pr['number']})
+        except ProviderError as e: results.append({'repo':repository['name'],'status':'failed','error':str(e)})
+    pattern['updated_at']=now();put('organization_pattern',pattern)
+    audit(f'{pattern["name"]} pattern applied to {len(results)} {pattern["organization"]} repositories','workflow',u['login'])
+    return {'results':results,'sample':DEMO,'truncated':len(repos)>100}
+def workflow_repository(project,repo_name):
+    if repo_name not in project.get('repositories',[]): raise HTTPException(400,'Repository is not attached to this project')
+    repository=next((r for r in records('repository') if r['id']==repo_name),None)
+    if not repository or repository.get('state')!='managed': raise HTTPException(403,'Manage this repository before editing its workflows')
+    return repository
+def workflow_branch(repository,project):
+    return repository.get('branch') or project.get('branch') or 'main'
+def workflow_token(repository,project):
+    return repository.get('installation_id') or project.get('provider_config',{}).get('installation_id')
+@app.get('/api/projects/{id}/workflows')
+async def list_workflows(id:str,repo:str,u=Depends(user)):
+    project=get(id,'project'); repository=workflow_repository(project,repo)
+    if DEMO:
+        files=[w for w in records('workflow') if w.get('project')==id and w.get('repo')==repo]
+        if not files:
+            files=[{'path':'.github/workflows/ci.yml','name':'CI','state':'active'}]
+        return {'workflows':[{'path':w['path'],'name':w.get('name',w['path'].rsplit('/',1)[-1]),'state':w.get('state','active')} for w in files]}
+    try:
+        token=await installation_token(workflow_token(repository,project))
+        data=await provider_request('GET',f'https://api.github.com/repos/{repo}/actions/workflows?per_page=100',token)
+        return {'workflows':[{'path':w['path'],'name':w['name'],'state':w['state']} for w in data.get('workflows',[]) if w.get('path','').startswith('.github/workflows/') and w.get('path','').endswith(('.yml','.yaml'))]}
+    except ProviderError as e: raise HTTPException(503,str(e))
+@app.get('/api/projects/{id}/workflows/content')
+async def workflow_content(id:str,repo:str,path:str,u=Depends(user)):
+    project=get(id,'project'); repository=workflow_repository(project,repo)
+    if not path.startswith('.github/workflows/') or '/' in path[len('.github/workflows/'): ] or not path.endswith(('.yml','.yaml')):
+        raise HTTPException(400,'Workflow path must be a YAML file directly under .github/workflows/')
+    if DEMO:
+        saved=next((w for w in records('workflow') if w.get('project')==id and w.get('repo')==repo and w.get('path')==path),None)
+        return saved or {'path':path,'name':path.rsplit('/',1)[-1],'content':'name: CI\\non:\\n  workflow_dispatch:\\njobs:\\n  build:\\n    runs-on: ubuntu-latest\\n    steps:\\n      - uses: actions/checkout@v4\\n','branch':workflow_branch(repository,project)}
+    try:
+        token=await installation_token(workflow_token(repository,project))
+        ref=quote(workflow_branch(repository,project),safe='')
+        item=await provider_request('GET',f'https://api.github.com/repos/{repo}/contents/{quote(path,safe="/")}?ref={ref}',token)
+        return {'path':path,'name':path.rsplit('/',1)[-1],'content':base64.b64decode(item['content']).decode('utf-8'),'sha':item['sha'],'branch':workflow_branch(repository,project)}
+    except (ProviderError,KeyError,ValueError,UnicodeDecodeError) as e:
+        raise HTTPException(503,f'Unable to read workflow file: {e}')
+@app.patch('/api/projects/{id}/workflows')
+async def update_workflow(id:str,body:WorkflowUpdate,u=Depends(admin)):
+    project=get(id,'project'); repository=workflow_repository(project,body.repo)
+    if body.mode not in ('pull_request','direct'): raise HTTPException(400,'Publish mode must be pull_request or direct')
+    if body.mode=='direct' and not body.branch: raise HTTPException(400,'Choose a target branch for a direct update')
+    default_branch=workflow_branch(repository,project)
+    if DEMO:
+        existing=next((w for w in records('workflow') if w.get('project')==id and w.get('repo')==body.repo and w.get('path')==body.path),None)
+        data={'id':existing['id'] if existing else uuid4().hex,'project':id,'repo':body.repo,'path':body.path,'name':body.path.rsplit('/',1)[-1],'content':body.content,'branch':body.branch or default_branch,'state':'active','mode':body.mode,'updated_at':now()}
+        put('workflow',data)
+        data['sample']=True
+        return data
+    try:
+        token=await installation_token(workflow_token(repository,project))
+        base_branch=body.branch if body.mode=='direct' and body.branch else default_branch
+        path=quote(body.path,safe='/'); ref=quote(base_branch,safe='')
+        try:
+            current=await provider_request('GET',f'https://api.github.com/repos/{body.repo}/contents/{path}?ref={ref}',token)
+            sha=current.get('sha')
+        except ProviderError as e:
+            if '404' not in str(e): raise
+            sha=None
+        target_branch=base_branch
+        if body.mode=='pull_request':
+            target_branch=f'cicd/workflow-{uuid4().hex[:12]}'
+            base=await provider_request('GET',f'https://api.github.com/repos/{body.repo}/git/ref/heads/{ref}',token)
+            await provider_request('POST',f'https://api.github.com/repos/{body.repo}/git/refs',token,json={'ref':f'refs/heads/{target_branch}','sha':base['object']['sha']})
+            if sha is not None:
+                current=await provider_request('GET',f'https://api.github.com/repos/{body.repo}/contents/{path}?ref={quote(target_branch,safe="")}',token)
+                sha=current.get('sha')
+        payload={'message':f'Update {body.path}','content':base64.b64encode(body.content.encode()).decode(),'branch':target_branch}
+        if sha: payload['sha']=sha
+        await provider_request('PUT',f'https://api.github.com/repos/{body.repo}/contents/{path}',token,json=payload)
+        result={'repo':body.repo,'path':body.path,'branch':target_branch,'mode':body.mode}
+        if body.mode=='pull_request':
+            pr=await provider_request('POST',f'https://api.github.com/repos/{body.repo}/pulls',token,json={'title':f'Update workflow: {body.path.rsplit("/",1)[-1]}','body':'Workflow YAML updated from the CI/CD control plane. Please review pipeline stages and permissions before merging.','head':target_branch,'base':base_branch})
+            result.update(number=pr['number'],html_url=pr['html_url'])
+        audit(f'{project["name"]}: workflow {body.mode} for {body.path}','workflow',u['login'])
+        return result
+    except HTTPException: raise
     except ProviderError as e: raise HTTPException(503,str(e))
 @app.post('/api/deployments/{id}/verify')
 async def verify(id:str,u=Depends(writer)):
@@ -227,6 +443,83 @@ async def settings(u=Depends(admin)):
 async def save_settings(body:dict,u=Depends(admin)):
     allowed={'workspace','ignore_archived','ignore_forks','ignore_patterns','notification_email','telegram_chat_id','notify_success','log_retention_days'}
     data=records('settings'); cfg=data[0] if data else {'id':'settings'}; cfg.update({k:v for k,v in body.items() if k in allowed}); put('settings',cfg); audit('Workspace settings updated',actor=u['login']); return cfg
+@app.get('/api/integrations/accounts')
+async def list_integration_accounts(u=Depends(admin)):
+    return {'accounts':records('integration_account'),'demo':DEMO}
+@app.post('/api/integrations/accounts')
+async def add_integration_account(body:ProviderAccountInput,u=Depends(admin)):
+    supported={'GitHub Pages','Cloudflare Pages','Vercel','Zoho Catalyst'}
+    if body.provider not in supported: raise HTTPException(400,'Unsupported deployment provider')
+    if body.provider in ('Cloudflare Pages','Vercel') and not body.access_token and not DEMO: raise HTTPException(400,'An API token is required for this provider')
+    if body.provider in ('GitHub Pages','Zoho Catalyst') and body.access_token: raise HTTPException(400,'Store these deployment credentials as GitHub Actions environment secrets; workflow inputs must never carry tokens.')
+    if body.provider=='Cloudflare Pages':
+        if not re.fullmatch(r'[a-fA-F0-9]{32}',body.account_id): raise HTTPException(400,'Cloudflare account ID must be 32 hexadecimal characters')
+        if not re.fullmatch(r'[a-z0-9][a-z0-9-]*',body.project_name): raise HTTPException(400,'Cloudflare Pages project name must use lowercase letters, numbers, and hyphens')
+    if body.provider=='GitHub Pages' and not body.account_id: raise HTTPException(400,'Enter the GitHub owner or organization for this account')
+    if body.provider=='Zoho Catalyst' and not body.project_name: raise HTTPException(400,'Enter the Catalyst project name')
+    key=os.getenv('MASTER_ENCRYPTION_KEY')
+    if body.access_token and not DEMO and not key: raise HTTPException(503,'Set MASTER_ENCRYPTION_KEY to store integration credentials securely.')
+    account_id=uuid4().hex
+    data={'id':account_id,'name':body.name.strip(),'provider':body.provider,'account_id':body.account_id.strip(),'project_name':body.project_name.strip(),'team_id':body.team_id.strip(),'credential_configured':bool(body.access_token) and not DEMO if body.provider in ('Cloudflare Pages','Vercel') else False,'created_at':now()}
+    if not data['name']: raise HTTPException(400,'Account name is required')
+    if body.access_token and not DEMO:
+        try:
+            if body.provider=='Cloudflare Pages':
+                verified=await provider_request('GET','https://api.cloudflare.com/client/v4/user/tokens/verify',body.access_token)
+                if verified.get('result',{}).get('status')!='active': raise ProviderError('Cloudflare API token is not active')
+            elif body.provider=='Vercel':
+                await provider_request('GET','https://api.vercel.com/v2/user',body.access_token)
+        except ProviderError as e: raise HTTPException(400,f'Could not verify {body.provider} credentials: {e}')
+        cipher=Fernet(key.encode()).encrypt(body.access_token.encode()).decode()
+        with Session() as db:
+            db.add(Secret(id=f'integration:{account_id}',project='integration',environment='workspace',name='ACCESS_TOKEN',ciphertext=cipher))
+            db.commit()
+    put('integration_account',data)
+    audit(f'{body.provider} account "{data["name"]}" added','integration',u['login'])
+    if body.provider in ('GitHub Pages','Zoho Catalyst'):
+        data['note']='Deployments use a repository GitHub Actions workflow. Keep provider credentials in GitHub Actions environment secrets; do not paste them into workflow_dispatch inputs.'
+    if DEMO: data['sample']=True
+    return data
+@app.delete('/api/integrations/accounts/{account_id}')
+async def delete_integration_account(account_id:str,u=Depends(admin)):
+    account=get(account_id,'integration_account')
+    linked=[p['name'] for p in records('project') if p.get('provider_config',{}).get('integration_account_id')==account_id]
+    if linked: raise HTTPException(409,'This account is selected by: '+', '.join(linked))
+    with Session() as db:
+        secret=db.get(Secret,f'integration:{account_id}')
+        if secret: db.delete(secret)
+        record=db.get(Record,account_id)
+        if record: db.delete(record)
+        db.commit()
+    audit(f'{account["provider"]} account "{account["name"]}" removed','integration',u['login'])
+    return {'ok':True}
+def integration_access_token(account_id):
+    key=os.getenv('MASTER_ENCRYPTION_KEY')
+    if not key: raise ProviderError('Set MASTER_ENCRYPTION_KEY to use connected deployment accounts.')
+    with Session() as db: secret=db.get(Secret,f'integration:{account_id}')
+    if not secret: raise ProviderError('Connected account credential is missing. Reconnect the provider account.')
+    try: return Fernet(key.encode()).decrypt(secret.ciphertext.encode()).decode()
+    except Exception as e: raise ProviderError('Could not decrypt connected account credentials; check MASTER_ENCRYPTION_KEY.') from e
+def provider_project(project):
+    p=dict(project)
+    p['provider_config']=dict(project.get('provider_config',{}))
+    if p.get('repositories'):
+        repository=next((r for r in records('repository') if r['id']==p['repositories'][0]),None)
+        if repository:
+            p['provider_config'].setdefault('installation_id',repository.get('installation_id'))
+    account_id=p['provider_config'].get('integration_account_id')
+    if account_id:
+        account=get(account_id,'integration_account')
+        if account.get('provider')!=p['provider']:
+            raise ProviderError('Selected deployment account does not match the project provider.')
+        if account.get('provider')=='Cloudflare Pages':
+            p['provider_config']['account_id']=account.get('account_id','')
+            p['provider_config']['project_name']=account.get('project_name','')
+        if account.get('provider')=='Vercel' and account.get('team_id'):
+            p['provider_config']['team_id']=account['team_id']
+        if account.get('provider') in ('Vercel','Cloudflare Pages') and not DEMO:
+            p['provider_config']['integration_token']=integration_access_token(account_id)
+    return p
 @app.get('/api/projects/{id}/secrets')
 async def list_secrets(id:str,u=Depends(admin)):
     with Session() as db: return [{'id':s.id,'name':s.name,'environment':s.environment} for s in db.query(Secret).filter_by(project=id).all()]
